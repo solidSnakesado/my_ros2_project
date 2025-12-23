@@ -17,18 +17,15 @@ class EyeInHandController(Node):
 
         self.bridge = CvBridge()
         self.state = "SEARCH"
-        
         self.joint_names = ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"]
         self.current_joints = None
 
-        # --- 정밀 설정값 ---
-        self.TARGET_RATIO = 0.085
-        self.CENTER_TOLERANCE = 20
-        self.STABLE_COUNT_TARGET = 15 
-        self.stable_counter = 0
-
+        # --- 설정값 ---
+        self.PICK_RATIO = 0.085       
         self.loss_patience = 0
-        self.MAX_PATIENCE = 50
+        self.MAX_PATIENCE = 40        
+        self.search_angle = 0.0
+        self.prev_target_center = None 
 
     def joint_callback(self, msg):
         joint_dict = dict(zip(msg.name, msg.position))
@@ -43,142 +40,109 @@ class EyeInHandController(Node):
         frame = self.bridge.imgmsg_to_cv2(data, "bgr8")
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-        # [수정] 로봇 몸체(하늘색)를 피하기 위해 색상 범위를 더 엄격하게 제한
-        # 보라색: 135-160 (기존보다 좁힘)
-        mask_purple = cv2.inRange(hsv, np.array([135, 50, 50]), np.array([160, 255, 255]))
-        # 초록색: 45-75 (기존보다 좁힘)
-        mask_green = cv2.inRange(hsv, np.array([45, 50, 50]), np.array([75, 255, 255]))
-        # 노랑색: 22-33
-        mask_yellow = cv2.inRange(hsv, np.array([22, 50, 50]), np.array([33, 255, 255]))
-
+        # 큐브 색상 마스크
+        mask_purple = cv2.inRange(hsv, np.array([130, 60, 50]), np.array([165, 255, 255]))
+        mask_green = cv2.inRange(hsv, np.array([35, 60, 50]), np.array([85, 255, 255])) 
+        mask_yellow = cv2.inRange(hsv, np.array([15, 60, 50]), np.array([40, 255, 255]))
         mask = cv2.bitwise_or(mask_purple, mask_green)
         mask = cv2.bitwise_or(mask, mask_yellow)
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        target_found = False
-        cx, cy, area, angle_rad = 0, 0, 0, 0.0
-
+        best_target = None
         if contours:
-            c = max(contours, key=cv2.contourArea)
-            area = cv2.contourArea(c)
-            # [수정] 몸체 일부가 인식되는 것을 방지하기 위해 면적 기준 상향 (400 -> 800)
-            if area > 800:
-                target_found = True
-                M = cv2.moments(c)
-                if M["m00"] > 0:
-                    cx, cy = int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
-                
-                rect = cv2.minAreaRect(c)
-                angle = rect[2]
-                w, h = rect[1]
-                if w < h: angle += 90
-                if angle > 45: angle -= 90
-                elif angle < -45: angle += 90
-                angle_rad = angle * (math.pi / 180.0)
+            valid_candidates = []
+            for cnt in contours:
+                area = cv2.contourArea(cnt)
+                # [수정] 인식 면적 기준 하향 (300 -> 150)
+                if 150 < area < (frame.shape[0] * frame.shape[1] * 0.3):
+                    M = cv2.moments(cnt)
+                    if M["m00"] > 0:
+                        cx, cy = int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
+                        valid_candidates.append((cnt, cx, cy, area))
 
-                box = np.int0(cv2.boxPoints(rect))
-                cv2.drawContours(frame, [box], 0, (0, 255, 0), 2)
+            if valid_candidates:
+                if self.prev_target_center is None:
+                    best_target = max(valid_candidates, key=lambda x: x[3])
+                else:
+                    best_target = min(valid_candidates, key=lambda x: math.hypot(x[1]-self.prev_target_center[0], x[2]-self.prev_target_center[1]))
 
-        if target_found:
+        if best_target:
+            cnt, cx, cy, area = best_target
+            self.prev_target_center = (cx, cy)
             self.loss_patience = 0
-            self.process_logic(cx, cy, area, angle_rad, frame.shape)
+            
+            rect = cv2.minAreaRect(cnt)
+            angle = rect[2]
+            w, h = rect[1]
+            if w < h: angle += 90
+            if angle > 45: angle -= 90
+            elif angle < -45: angle += 90
+            angle_rad = angle * (math.pi / 180.0)
+
+            cv2.drawContours(frame, [np.int0(cv2.boxPoints(rect))], 0, (0, 255, 0), 2)
+            self.run_visual_servoing(cx, cy, area, angle_rad, frame.shape)
         else:
             self.loss_patience += 1
             if self.loss_patience > self.MAX_PATIENCE:
-                if self.state != "SEARCH":
-                    self.get_logger().info("Target Lost! -> Adjusting View for Search")
-                    self.state = "SEARCH"
-                    self.stable_counter = 0
-                self.execute_search()
+                self.state = "SEARCH"
+                self.prev_target_center = None
+                self.run_search_mode()
 
-        ratio = area / (frame.shape[0]*frame.shape[1]) if frame.shape[0] > 0 else 0
-        cv2.putText(frame, f"STATE: {self.state} | RATIO: {ratio:.4f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        cv2.putText(frame, f"MODE: {self.state} | LOCKED: {self.prev_target_center is not None}", 
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         cv2.imshow("Robot View", frame)
         cv2.waitKey(1)
 
-    def process_logic(self, cx, cy, area, target_angle, shape):
+    def run_visual_servoing(self, cx, cy, area, target_angle, shape):
+        self.state = "SERVOING"
         h, w, _ = shape
         err_x, err_y = (w // 2) - cx, (h // 2) - cy
         ratio = area / (w * h)
 
-        if self.state == "SEARCH":
-            self.state = "CENTERING"
-            self.stable_counter = 0
+        if ratio > self.PICK_RATIO:
+            self.get_logger().info("Target Reached! Ready to Pick.")
+            self.state = "PICK"
+            return
 
-        if self.state == "CENTERING":
-            self.control_arm(err_x, err_y, 0, "CENTER")
-            if abs(err_x) < self.CENTER_TOLERANCE and abs(err_y) < self.CENTER_TOLERANCE:
-                self.stable_counter += 1
-                if self.stable_counter >= self.STABLE_COUNT_TARGET:
-                    self.state = "ALIGNING"
-                    self.stable_counter = 0
-            else:
-                self.stable_counter = max(0, self.stable_counter - 1)
-
-        elif self.state == "ALIGNING":
-            self.control_arm(err_x, err_y, target_angle, "ALIGN")
-            if abs(target_angle) < 0.05:
-                self.stable_counter += 1
-                if self.stable_counter >= 10:
-                    self.state = "APPROACHING"
-            else:
-                self.stable_counter = 0
-
-        elif self.state == "APPROACHING":
-            self.control_arm(err_x, err_y, target_angle, "DIVE")
-            if ratio > self.TARGET_RATIO:
-                self.state = "PICK"
-                self.get_logger().info("Target Locked-on Ready!")
-            
-            if abs(err_x) > 60 or abs(err_y) > 60: 
-                self.state = "CENTERING"
-                self.stable_counter = 0
-
-    def control_arm(self, err_x, err_y, target_angle, mode):
-        if self.current_joints is None: return
         next_q = self.current_joints[:]
+        k_pan = 0.0022; k_reach = 0.0028; k_dive = 0.0095; k_rot = 0.15
 
-        k_p = 0.0016; k_r = 0.0008; k_d = 0.0035; k_rot = 0.12
+        next_q[0] += err_x * k_pan          
+        next_q[5] += target_angle * k_rot   
 
-        next_q[0] += err_x * k_p
-
-        if mode == "CENTER":
-            next_q[1] -= err_y * k_r
-        elif mode == "ALIGN":
-            next_q[1] -= err_y * k_r
-            next_q[5] += target_angle * k_rot
-        elif mode == "DIVE":
-            next_q[1] -= k_d * 0.7
-            next_q[2] -= k_d * 0.4
-            next_q[2] -= err_y * 0.0004
-            next_q[5] += target_angle * k_rot
+        # [검증된 방향] Joint 2를 - 방향으로 접으며 하강
+        next_q[1] -= k_dive 
+        # Joint 3는 위로 접어 올려(+) 몸체 거리 확보
+        next_q[2] += k_dive * 0.6  
+        next_q[2] -= err_y * k_reach
 
         next_q[4] = -1.57 - (next_q[1] + next_q[2])
 
-        next_q[1] = float(np.clip(next_q[1], -3.1, 1.5))
-        next_q[2] = float(np.clip(next_q[2], -3.5, 1.5))
-        next_q[4] = float(np.clip(next_q[4], -3.5, 1.5))
+        # 관절 제한
+        next_q[1] = float(np.clip(next_q[1], -2.5, 0.5)) 
+        next_q[2] = float(np.clip(next_q[2], -1.5, 3.0)) 
+        next_q[4] = float(np.clip(next_q[4], -3.14, 3.14))
         next_q[5] = float(np.clip(next_q[5], -3.14, 3.14))
 
         self.publish_traj(next_q)
 
-    def execute_search(self):
+    def run_search_mode(self):
         if self.current_joints is None: return
         next_q = self.current_joints[:]
         
-        # [중요 수정] 자기 몸체를 보지 않도록 시야를 더 바깥쪽으로 고정
-        # 어깨(J2)는 더 앞으로 내밀고(0.6), 팔꿈치(J3)는 약간 펴서(-0.7) 바닥 중심부를 멀리서 보게 함
-        target_shoulder = 0.6
-        target_elbow = -0.7
+        # [수정] 테이블과 더 가까운 탐색 자세 (Low Crane Pose)
+        # J2를 -0.8까지 숙여서 테이블 중심을 가까이서 비춤
+        target_shoulder = -0.8 
+        target_elbow = 0.8   
+        
         next_q[1] = next_q[1] * 0.95 + target_shoulder * 0.05
         next_q[2] = next_q[2] * 0.95 + target_elbow * 0.05
         
-        next_q[0] += 0.035
-        if next_q[0] > math.pi: next_q[0] -= 2 * math.pi
-        
+        self.search_angle += 0.040
+        if self.search_angle > math.pi: self.search_angle -= 2*math.pi
+        next_q[0] = self.search_angle
         next_q[4] = -1.57 - (next_q[1] + next_q[2])
-        
         self.publish_traj(next_q)
 
     def publish_traj(self, positions):
